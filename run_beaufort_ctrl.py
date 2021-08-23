@@ -12,6 +12,9 @@ import matplotlib.pyplot as plt
 import cmocean.cm as cm
 import aronnax.driver as drv
 from aronnax.utils import working_directory
+from aronnax.core import interpret_raw_file, Grid
+from netCDF4 import Dataset
+from glob import glob
 
 ##############################################################################
 # WIND STRESS FORMULATION                                                    #
@@ -102,6 +105,8 @@ param = {# DOMAIN GEOMETRY
          'Lz'        :  2.0e3,     # Domain depth in metres
          'H1'        :  0.4e3,     # Layer 1 depth in metres
 
+         'layers'    :      2,     # Number of layers
+
          # WIND FORCING
          'tau_max'   :   1e-1,     # Maximum wind stress (N/m^2)
 
@@ -112,10 +117,209 @@ param = {# DOMAIN GEOMETRY
          'lat'       :    90.,     # Latitude (deg) to calculate f at
 
          # NUMERICS
-         'dt'        :    50.,     # Time step (seconds)
-         'nt'        :51840*12,     # Number of time steps
-         'out_freq'  :     1.,     # Output frequency (days)
+         'dt'        :    60.,     # Time step (seconds)
+         'sim_time'  :    10.,     # Simulation runtime (days)
+         'snap_freq' :     1.,     # Output frequency (days)
+         'av_freq'   :     1.,     # Average frequency (days)
+         'chk_freq'  :   360.,     # Checkpoint frequency (days)
+
+         # FILE NAMES
+         'netcdf_name'  : 'ctrl_test.nc'
          }
+
+# Add some extra calculated variables
+param['nx'] = int(param['Lx']/param['res'])
+param['ny'] = int(param['Ly']/param['res'])
+
+##############################################################################
+# FUNCTIONS                                                                  #
+##############################################################################
+
+def convert_to_netcdf(dir_in, dir_out, **kwargs):
+    # This script converts the output from Aronnax from binary to netcdf
+    # format
+
+    # dir_in : where the raw binary files from Aronnax are found
+    # dir_out: where the processed netcdf files should be placed
+
+    proc_snap, proc_av = False, False
+
+    if {'snap'} <= kwargs.keys():
+        if kwargs['snap']:
+            proc_snap = True
+            snap_files = {}
+
+    if {'av'} <= kwargs.keys():
+        if kwargs['av']:
+            proc_av = True
+            av_files = {}
+
+    if (proc_snap == False) and (proc_av == False):
+        raise NotImplementedError('Must select at least one of snap or av!')
+
+    # Retrieve file names
+    var_list = ['h', 'eta', 'u', 'v']
+
+    if proc_snap:
+        for var in var_list:
+            snap_files[var] = sorted(glob(dir_in + 'snap.' + var + '.*'))
+
+    if proc_av:
+        for var in var_list:
+            av_files[var] = sorted(glob(dir_in + 'av.' + var + '.*'))
+
+    # Set up the model grid
+    model_grid = Grid(nx=param['nx'], ny=param['ny'], layers=param['layers'],
+                      dx=param['res'], dy=param['res'])
+
+    # Calculate the expected number of output files
+    nt_snap = int(param['sim_time']/param['snap_freq'] + 1)
+    nt_av = int(param['sim_time']/param['av_freq'])
+
+    if not (len(snap_files['h']) == nt_snap)*(len(av_files['h']) == nt_av):
+        raise ValueError('Expected ' + str(nt_snap) + ' snapshots but found ' +
+                         str(len(snap_files['h'])) + '. Expected ' + str(nt_av) +
+                         ' averages but found ' + str(len(av_files['h'])) + '.')
+
+    # Now read in the files
+    if proc_snap:
+        # Generate empty container arrays
+        snap = {}
+        for var in var_list:
+            var_shape = interpret_raw_file(snap_files[var][0],
+                                           param['nx'],
+                                           param['ny'],
+                                           param['layers']).shape
+            snap[var] = np.zeros(((nt_snap,) + var_shape))
+
+        # Fill array
+        for var in ['h', 'eta', 'u', 'v']:
+            for i, fh in enumerate(snap_files[var]):
+                snap[var][i, :, :, :] = interpret_raw_file(fh,
+                                                           param['nx'],
+                                                           param['ny'],
+                                                           param['layers'])
+
+    if proc_av:
+        # Generate empty container arrays
+        av = {}
+        for var in var_list:
+            var_shape = interpret_raw_file(av_files[var][0],
+                                           param['nx'],
+                                           param['ny'],
+                                           param['layers']).shape
+            av[var] = np.zeros(((nt_av,) + var_shape))
+
+        # Fill array
+        for var in ['h', 'eta', 'u', 'v']:
+            for i, fh in enumerate(av_files[var]):
+                av[var][i, :, :, :] = interpret_raw_file(fh,
+                                                         param['nx'],
+                                                         param['ny'],
+                                                         param['layers'])
+    # Now generate the time array
+    if proc_snap:
+        snap_time = np.arange(0, (param['sim_time'] + param['snap_freq'])*86400,
+                              param['snap_freq']*86400)
+
+    if proc_av:
+        av_time = np.arange(param['av_freq']*86400,
+                              (param['sim_time'] + param['av_freq'])*86400,
+                              param['av_freq']*86400)
+
+    # Now export to netcdf
+    with Dataset(dirs['ctrl'] + '/netcdf-output/' + param['netcdf_name'],
+                 mode='w') as nc:
+
+        # Create the dimensions
+        if proc_snap:
+            nc.createDimension('snapt', nt_snap)
+
+        if proc_av:
+            nc.createDimension('avt', nt_av)
+
+        nc.createDimension('layers', param['layers'])
+        nc.createDimension('sfc', 1)
+        nc.createDimension('x', len(model_grid.x))
+        nc.createDimension('xp1', len(model_grid.xp1))
+        nc.createDimension('y', len(model_grid.y))
+        nc.createDimension('yp1', len(model_grid.yp1))
+
+        # Create the variables
+        if proc_snap:
+            nc.createVariable('time_snap', 'f8', ('snapt'), zlib=True)
+            nc.variables['time_snap'].long_name = 'time_since_initialization_(snapshots)'
+            nc.variables['time_snap'].units = 'second'
+            nc.variables['time_snap'].standard_name = 'snapshot_time'
+            nc.variables['time_snap'].axis = 'T'
+
+            nc.createVariable('u_snap', 'f8', ('snapt', 'layers', 'y', 'xp1'), zlib=True)
+            nc.variables['u_snap'].long_name = 'u_velocity_snapshot_at_u_points'
+            nc.variables['u_snap'].units = 'metres per second'
+            nc.variables['u_snap'].standard_name = 'u_snap'
+            nc.variables['u_snap'].coordinates = 'y xp1'
+
+            nc.createVariable('v_snap', 'f8', ('snapt', 'layers', 'yp1', 'x'), zlib=True)
+            nc.variables['v_snap'].long_name = 'v_velocity_snapshot_at_v_points'
+            nc.variables['v_snap'].units = 'metres per second'
+            nc.variables['v_snap'].standard_name = 'v_snap'
+            nc.variables['v_snap'].coordinates = 'yp1 x'
+
+            nc.createVariable('h_snap', 'f8', ('snapt', 'layers', 'y', 'x'), zlib=True)
+            nc.variables['h_snap'].long_name = 'layer_thickness_snapshot_at_tracer_points'
+            nc.variables['h_snap'].units = 'metres'
+            nc.variables['h_snap'].standard_name = 'h_snap'
+            nc.variables['h_snap'].coordinates = 'y x'
+
+            nc.createVariable('eta_snap', 'f8', ('snapt', 'sfc', 'y', 'x'), zlib=True)
+            nc.variables['eta_snap'].long_name = 'free_surface_snapshot_at_tracer_points'
+            nc.variables['eta_snap'].units = 'metres'
+            nc.variables['eta_snap'].standard_name = 'eta_snap'
+            nc.variables['eta_snap'].coordinates = 'y x'
+
+            nc.variables['time_snap'][:] = snap_time
+            nc.variables['u_snap'][:] = snap['u']
+            nc.variables['v_snap'][:] = snap['v']
+            nc.variables['h_snap'][:] = snap['h']
+            nc.variables['eta_snap'][:] = snap['eta']
+
+        if proc_av:
+            nc.createVariable('time_av', 'f8', ('avt'), zlib=True)
+            nc.variables['time_av'].long_name = 'time_since_initialization_at_end_of_averaging_period'
+            nc.variables['time_av'].units = 'second'
+            nc.variables['time_av'].standard_name = 'average_time'
+            nc.variables['time_av'].axis = 'T'
+            nc.variables['time_av'].averaging_period = str(param['av_freq']) + ' days'
+
+            nc.createVariable('u_av', 'f8', ('avt', 'layers', 'y', 'xp1'), zlib=True)
+            nc.variables['u_av'].long_name = 'u_velocity_average_at_u_points'
+            nc.variables['u_av'].units = 'metres per second'
+            nc.variables['u_av'].standard_name = 'u_av'
+            nc.variables['u_av'].coordinates = 'y xp1'
+
+            nc.createVariable('v_av', 'f8', ('avt', 'layers', 'yp1', 'x'), zlib=True)
+            nc.variables['v_av'].long_name = 'v_velocity_average_at_v_points'
+            nc.variables['v_av'].units = 'metres per second'
+            nc.variables['v_av'].standard_name = 'v_av'
+            nc.variables['v_av'].coordinates = 'yp1 x'
+
+            nc.createVariable('h_av', 'f8', ('avt', 'layers', 'y', 'x'), zlib=True)
+            nc.variables['h_av'].long_name = 'layer_thickness_average_at_tracer_points'
+            nc.variables['h_av'].units = 'metres'
+            nc.variables['h_av'].standard_name = 'h_av'
+            nc.variables['h_av'].coordinates = 'y x'
+
+            nc.createVariable('eta_av', 'f8', ('avt', 'sfc', 'y', 'x'), zlib=True)
+            nc.variables['eta_av'].long_name = 'free_surface_average_at_tracer_points'
+            nc.variables['eta_av'].units = 'metres'
+            nc.variables['eta_av'].standard_name = 'eta_av'
+            nc.variables['eta_av'].coordinates = 'y x'
+
+            nc.variables['time_av'][:] = av_time
+            nc.variables['u_av'][:] = av['u']
+            nc.variables['v_av'][:] = av['v']
+            nc.variables['h_av'][:] = av['h']
+            nc.variables['eta_av'][:] = av['eta']
 
 
 def run_beaufort_ctrl():
@@ -353,8 +557,11 @@ def run_beaufort_ctrl():
         # Also plot the vertical component of the wind stress curl (for
         # diagnostic purposes, not used in Aronnax code)
 
-        X = np.arange(param['res']/2, param['Lx']+param['res']/2, param['res'])
-        Y = np.arange(param['res']/2, param['Ly']+param['res']/2, param['res'])
+        X = Grid(nx=param['nx'], ny=param['ny'], layers=param['layers'],
+                 dx=param['res'], dy=param['res']).x
+        Y = Grid(nx=param['nx'], ny=param['ny'], layers=param['layers'],
+                 dx=param['res'], dy=param['res']).y
+
         X, Y = np.meshgrid(X, Y)
 
         taux = tau_x_poly(X, Y)
@@ -450,19 +657,25 @@ def run_beaufort_ctrl():
                      depthFile            = [bath_ctrl],
                      fUfile               = [f0],
                      fVfile               = [f0],
-                     layers               = 2,
-                     nx                   = int(param['Lx']/param['res']),
-                     ny                   = int(param['Ly']/param['res']),
+                     layers               = param['layers'],
+                     nx                   = param['nx'],
+                     ny                   = param['ny'],
                      dx                   = param['res'],
                      dy                   = param['res'],
                      exe                  = 'aronnax_external_solver',
                      dt                   = param['dt'],
-                     nTimeSteps           = param['nt'],
-                     dumpFreq             = 86400.*param['out_freq'],
-                     avFreq               = 86400.*param['out_freq'],
-                     checkpointFreq       = 86400.*param['out_freq'],
+                     # Add a +1 to nTimeSteps so Aronnax saves the last frame
+                     nTimeSteps           = int(np.ceil(86400.*param['sim_time']/
+                                                    param['dt']))+1,
+                     dumpFreq             = 86400.*param['snap_freq'],
+                     avFreq               = 86400.*param['av_freq'],
+                     checkpointFreq       = 86400.*param['chk_freq'],
                      )
 
 
 if __name__ == '__main__':
-    run_beaufort_ctrl()
+    # run_beaufort_ctrl()
+    convert_to_netcdf(dirs['ctrl'] + '/output/',
+                      dirs['ctrl'] + '/netcdf-output/',
+                      snap=True,
+                      av=True)
